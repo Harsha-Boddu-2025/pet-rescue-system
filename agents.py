@@ -21,13 +21,38 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+def get_config(name: str, default: str = None) -> str:
+    """
+    Read a setting from the environment, falling back to Streamlit secrets.
+
+    Streamlit Cloud puts secrets in st.secrets. Depending on the version they
+    may or may not also appear in os.environ, so check both rather than
+    assuming.
+    """
+    value = os.getenv(name)
+    if value:
+        return value
+
+    try:
+        import streamlit as st
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+
+    return default
+
+
 # ============================================================================
-# MODEL IDS (override in .env if NVIDIA renames / you pick different models)
+# MODEL IDS (override in .env or Streamlit secrets)
 # Browse exact IDs at https://build.nvidia.com/models
+# NOTE: NIM returns HTTP 410 for retired models, not 404. If you get a 410,
+# the model ID is dead — curl-test a replacement before setting it here.
 # ============================================================================
 
-VISION_MODEL = os.getenv("NIM_VISION_MODEL", "nvidia/nemotron-nano-12b-v2-vl")
-REASONING_MODEL = os.getenv("NIM_REASONING_MODEL", "nvidia/nvidia-nemotron-nano-9b-v2")
+VISION_MODEL = get_config("NIM_VISION_MODEL", "meta/llama-3.2-11b-vision-instruct")
+REASONING_MODEL = get_config("NIM_REASONING_MODEL", "meta/llama-3.2-11b-vision-instruct")
 
 # ============================================================================
 # SEVERITY LEVELS & DATA STRUCTURES
@@ -104,8 +129,8 @@ class NIMClient:
         two separate NVIDIA accounts to get more free-tier headroom. Two keys
         from the SAME account share one quota, so that buys you nothing.
         """
-        self.api_key = api_key or os.getenv("NVIDIA_NIM_API_KEY")
-        self.base_url = base_url or os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+        self.api_key = api_key or get_config("NVIDIA_NIM_API_KEY")
+        self.base_url = base_url or get_config("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
         
         if not self.api_key:
             raise ValueError("NVIDIA_NIM_API_KEY not set. Get free access at https://build.nvidia.com/explore/discover")
@@ -115,6 +140,38 @@ class NIMClient:
             "Content-Type": "application/json"
         }
     
+    def _explain_error(self, response, model: str) -> str:
+        """Translate NIM HTTP status codes into something actionable."""
+        code = response.status_code
+
+        # NIM echoes a reason in the body often enough to be worth surfacing
+        detail = ""
+        try:
+            body = response.json()
+            detail = body.get("detail") or body.get("message") or ""
+        except Exception:
+            detail = (response.text or "")[:200]
+
+        hints = {
+            401: "API key is invalid or expired. Regenerate it at "
+                 "https://build.nvidia.com/settings/api-keys",
+            403: "Key is valid but not permitted to call this model. Check that "
+                 "'Public API Endpoints' is enabled for your key.",
+            404: f"Model '{model}' does not exist. Browse current IDs at "
+                 f"https://build.nvidia.com/models and override with "
+                 f"NIM_VISION_MODEL / NIM_REASONING_MODEL.",
+            410: "Your NVIDIA account is missing the 'Public API Endpoints' "
+                 "permission, so inference is blocked for every model. Verify your "
+                 "developer profile and phone number at build.nvidia.com, then "
+                 "request access on the NVIDIA Developer Forums (Access/Accounts). "
+                 "A key that passes GET /v1/models but fails here confirms this.",
+            429: "Rate limit reached (new accounts get roughly 40 requests/min). "
+                 "Wait a moment and retry.",
+        }
+
+        hint = hints.get(code, "Unexpected response from NVIDIA NIM.")
+        return f"HTTP {code} — {hint}" + (f" (server said: {detail})" if detail else "")
+
     def call_model(self, model: str, messages: List[Dict], temperature: float = 0.7, 
                    max_tokens: int = 1024) -> str:
         """Call NVIDIA NIM text model"""
@@ -130,12 +187,17 @@ class NIMClient:
         
         try:
             response = requests.post(url, json=payload, headers=self.headers, timeout=30)
-            response.raise_for_status()
+            if not response.ok:
+                msg = self._explain_error(response, model)
+                logger.error(f"NIM API error: {msg}")
+                raise RuntimeError(msg)
             data = response.json()
             return data["choices"][0]["message"]["content"]
+        except requests.exceptions.Timeout:
+            raise RuntimeError("NVIDIA NIM timed out after 30s. Try again.")
         except requests.exceptions.RequestException as e:
             logger.error(f"NIM API error: {e}")
-            raise
+            raise RuntimeError(f"Could not reach NVIDIA NIM: {e}")
     
     def call_vision_model(self, model: str, image_base64: str, prompt: str) -> str:
         """Call NVIDIA NIM vision model"""
@@ -166,12 +228,17 @@ class NIMClient:
         
         try:
             response = requests.post(url, json=payload, headers=self.headers, timeout=30)
-            response.raise_for_status()
+            if not response.ok:
+                msg = self._explain_error(response, model)
+                logger.error(f"NIM Vision API error: {msg}")
+                raise RuntimeError(msg)
             data = response.json()
             return data["choices"][0]["message"]["content"]
+        except requests.exceptions.Timeout:
+            raise RuntimeError("NVIDIA NIM timed out after 30s. Try again.")
         except requests.exceptions.RequestException as e:
             logger.error(f"NIM Vision API error: {e}")
-            raise
+            raise RuntimeError(f"Could not reach NVIDIA NIM: {e}")
 
 # ============================================================================
 # AGENT 1: CONDITION AGENT 👁️
@@ -540,10 +607,10 @@ class PetRescueOrchestrator:
         only when the two keys belong to different NVIDIA accounts — keys from
         one account share a single quota.
         """
-        shared = api_key or os.getenv("NVIDIA_NIM_API_KEY")
+        shared = api_key or get_config("NVIDIA_NIM_API_KEY")
 
-        vision_key = vision_api_key or os.getenv("NIM_VISION_API_KEY") or shared
-        reasoning_key = reasoning_api_key or os.getenv("NIM_REASONING_API_KEY") or shared
+        vision_key = vision_api_key or get_config("NIM_VISION_API_KEY") or shared
+        reasoning_key = reasoning_api_key or get_config("NIM_REASONING_API_KEY") or shared
 
         # Reuse one client when the keys match, so we don't open two identical sessions
         self.vision_nim = NIMClient(api_key=vision_key)

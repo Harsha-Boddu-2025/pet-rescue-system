@@ -158,6 +158,22 @@ with st.sidebar:
     
     st.divider()
     
+    st.divider()
+
+    with st.expander("🔧 Active config"):
+        import agents as _a
+        st.caption("Models currently in use:")
+        st.code(f"vision:    {_a.VISION_MODEL}\nreasoning: {_a.REASONING_MODEL}", language=None)
+        key = _a.get_config("NVIDIA_NIM_API_KEY")
+        if key:
+            st.caption(f"API key loaded: {key[:10]}…{key[-4:]}")
+        else:
+            st.error("No API key found in secrets")
+        st.caption(
+            "A 410 error means the model ID is retired. Override "
+            "NIM_VISION_MODEL / NIM_REASONING_MODEL in Settings → Secrets."
+        )
+
     if st.button("🔄 Refresh System", use_container_width=True):
         st.cache_resource.clear()
         st.success("✅ System refreshed")

@@ -96,6 +96,14 @@ class NIMClient:
     """Unified client for NVIDIA NIM APIs"""
     
     def __init__(self, api_key: str = None, base_url: str = None):
+        """
+        api_key: falls back to NVIDIA_NIM_API_KEY.
+
+        One key works for every model — NIM selects the model per request, not
+        per key. Pass a different key only if you want to split traffic across
+        two separate NVIDIA accounts to get more free-tier headroom. Two keys
+        from the SAME account share one quota, so that buys you nothing.
+        """
         self.api_key = api_key or os.getenv("NVIDIA_NIM_API_KEY")
         self.base_url = base_url or os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
         
@@ -520,12 +528,36 @@ INCONCLUSIVE: Can't determine from images.
 class PetRescueOrchestrator:
     """Main orchestrator - coordinates all 4 agents"""
     
-    def __init__(self, api_key: str = None):
-        self.nim = NIMClient(api_key=api_key)
-        self.condition_agent = ConditionAgent(self.nim)
-        self.response_agent = ResponseAgent(self.nim)
-        self.coordination_agent = CoordinationAgent(self.nim)
-        self.verification_agent = VerificationAgent(self.nim)
+    def __init__(self, api_key: str = None,
+                 vision_api_key: str = None,
+                 reasoning_api_key: str = None):
+        """
+        Normal setup: set NVIDIA_NIM_API_KEY only. All four agents share it.
+
+        Optional split: set NIM_VISION_API_KEY and/or NIM_REASONING_API_KEY to
+        route the vision agents (Condition, Verification) and the reasoning
+        agents (Response, Coordination) through different keys. Worth doing
+        only when the two keys belong to different NVIDIA accounts — keys from
+        one account share a single quota.
+        """
+        shared = api_key or os.getenv("NVIDIA_NIM_API_KEY")
+
+        vision_key = vision_api_key or os.getenv("NIM_VISION_API_KEY") or shared
+        reasoning_key = reasoning_api_key or os.getenv("NIM_REASONING_API_KEY") or shared
+
+        # Reuse one client when the keys match, so we don't open two identical sessions
+        self.vision_nim = NIMClient(api_key=vision_key)
+        self.reasoning_nim = (
+            self.vision_nim if reasoning_key == vision_key else NIMClient(api_key=reasoning_key)
+        )
+
+        # Kept for backwards compatibility with code that referenced .nim
+        self.nim = self.vision_nim
+
+        self.condition_agent = ConditionAgent(self.vision_nim)
+        self.response_agent = ResponseAgent(self.reasoning_nim)
+        self.coordination_agent = CoordinationAgent(self.reasoning_nim)
+        self.verification_agent = VerificationAgent(self.vision_nim)
     
     def process_rescue_case(self, image_base64: str, location: str = "Unknown") -> Dict:
         """

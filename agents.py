@@ -6,6 +6,7 @@ Uses NVIDIA NIM free APIs (Nemotron models)
 import os
 import json
 import base64
+import time
 import requests
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
@@ -50,6 +51,11 @@ def get_config(name: str, default: str = None) -> str:
 # NOTE: NIM returns HTTP 410 for retired models, not 404. If you get a 410,
 # the model ID is dead — curl-test a replacement before setting it here.
 # ============================================================================
+
+# Vision models on the free tier can take a while on a cold start, and requests
+# queue under load. 120s is generous but beats failing a rescue analysis.
+REQUEST_TIMEOUT = int(get_config("NIM_TIMEOUT", "120"))
+MAX_RETRIES = int(get_config("NIM_MAX_RETRIES", "2"))
 
 VISION_MODEL = get_config("NIM_VISION_MODEL", "meta/llama-3.2-11b-vision-instruct")
 REASONING_MODEL = get_config("NIM_REASONING_MODEL", "meta/llama-3.2-11b-vision-instruct")
@@ -160,17 +166,68 @@ class NIMClient:
             404: f"Model '{model}' does not exist. Browse current IDs at "
                  f"https://build.nvidia.com/models and override with "
                  f"NIM_VISION_MODEL / NIM_REASONING_MODEL.",
-            410: "Your NVIDIA account is missing the 'Public API Endpoints' "
-                 "permission, so inference is blocked for every model. Verify your "
-                 "developer profile and phone number at build.nvidia.com, then "
-                 "request access on the NVIDIA Developer Forums (Access/Accounts). "
-                 "A key that passes GET /v1/models but fails here confirms this.",
+            410: f"Model '{model}' has been retired by NVIDIA. NIM returns 410 "
+                 f"(not 404) for models it no longer serves. Pick a live one at "
+                 f"https://build.nvidia.com/models and set NIM_VISION_MODEL / "
+                 f"NIM_REASONING_MODEL in your secrets. If every model 410s, your "
+                 f"account may be missing the 'Public API Endpoints' permission.",
             429: "Rate limit reached (new accounts get roughly 40 requests/min). "
                  "Wait a moment and retry.",
         }
 
         hint = hints.get(code, "Unexpected response from NVIDIA NIM.")
         return f"HTTP {code} — {hint}" + (f" (server said: {detail})" if detail else "")
+
+    def _post_with_retry(self, url: str, payload: Dict, model: str) -> str:
+        """
+        POST to NIM, retrying on timeouts and rate limits.
+
+        Retries only transient failures. A bad model ID or bad key fails the
+        same way every time, so retrying those just wastes the user's time.
+        """
+        last_error = None
+
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                response = requests.post(
+                    url, json=payload, headers=self.headers, timeout=REQUEST_TIMEOUT
+                )
+
+                if response.ok:
+                    data = response.json()
+                    return data["choices"][0]["message"]["content"]
+
+                # 429 and 5xx are worth another try; everything else is permanent
+                if response.status_code == 429 or response.status_code >= 500:
+                    last_error = RuntimeError(self._explain_error(response, model))
+                    if attempt < MAX_RETRIES:
+                        wait = 2 ** attempt
+                        logger.warning(
+                            f"NIM {response.status_code} on attempt {attempt + 1}, "
+                            f"retrying in {wait}s"
+                        )
+                        time.sleep(wait)
+                        continue
+
+                msg = self._explain_error(response, model)
+                logger.error(f"NIM API error: {msg}")
+                raise RuntimeError(msg)
+
+            except requests.exceptions.Timeout:
+                last_error = RuntimeError(
+                    f"NVIDIA NIM timed out after {REQUEST_TIMEOUT}s "
+                    f"({MAX_RETRIES + 1} attempts). The free tier gets slow under "
+                    f"load — wait a moment and try again."
+                )
+                if attempt < MAX_RETRIES:
+                    logger.warning(f"Timeout on attempt {attempt + 1}, retrying")
+                    continue
+
+            except requests.exceptions.RequestException as e:
+                logger.error(f"NIM API error: {e}")
+                raise RuntimeError(f"Could not reach NVIDIA NIM: {e}")
+
+        raise last_error
 
     def call_model(self, model: str, messages: List[Dict], temperature: float = 0.7, 
                    max_tokens: int = 1024) -> str:
@@ -185,19 +242,7 @@ class NIMClient:
             "top_p": 0.7
         }
         
-        try:
-            response = requests.post(url, json=payload, headers=self.headers, timeout=30)
-            if not response.ok:
-                msg = self._explain_error(response, model)
-                logger.error(f"NIM API error: {msg}")
-                raise RuntimeError(msg)
-            data = response.json()
-            return data["choices"][0]["message"]["content"]
-        except requests.exceptions.Timeout:
-            raise RuntimeError("NVIDIA NIM timed out after 30s. Try again.")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"NIM API error: {e}")
-            raise RuntimeError(f"Could not reach NVIDIA NIM: {e}")
+        return self._post_with_retry(url, payload, model)
     
     def call_vision_model(self, model: str, image_base64: str, prompt: str) -> str:
         """Call NVIDIA NIM vision model"""
@@ -226,19 +271,7 @@ class NIMClient:
             "max_tokens": 1024
         }
         
-        try:
-            response = requests.post(url, json=payload, headers=self.headers, timeout=30)
-            if not response.ok:
-                msg = self._explain_error(response, model)
-                logger.error(f"NIM Vision API error: {msg}")
-                raise RuntimeError(msg)
-            data = response.json()
-            return data["choices"][0]["message"]["content"]
-        except requests.exceptions.Timeout:
-            raise RuntimeError("NVIDIA NIM timed out after 30s. Try again.")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"NIM Vision API error: {e}")
-            raise RuntimeError(f"Could not reach NVIDIA NIM: {e}")
+        return self._post_with_retry(url, payload, model)
 
 # ============================================================================
 # AGENT 1: CONDITION AGENT 👁️
